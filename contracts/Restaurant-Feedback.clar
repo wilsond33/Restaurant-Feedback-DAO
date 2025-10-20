@@ -20,6 +20,9 @@
 (define-constant ERR-INSUFFICIENT-REWARD-POOL (err u113))
 (define-constant ERR-MILESTONE-NOT-REACHED (err u114))
 (define-constant ERR-COOLDOWN-ACTIVE (err u115))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u116))
+(define-constant ERR-CIRCULAR-DELEGATION (err u117))
+(define-constant ERR-NO-DELEGATION-FOUND (err u118))
 
 (define-constant REWARD-POOL-BASE u1000000)
 (define-constant ACHIEVEMENT-MULTIPLIER u2)
@@ -106,6 +109,20 @@
         total-claimed: uint,
         consecutive-claims: uint
     }
+)
+
+(define-map delegations
+    principal
+    {
+        delegate: principal,
+        delegation-block: uint,
+        active: bool
+    }
+)
+
+(define-map delegation-power
+    principal
+    { total-delegated-power: uint }
 )
 
 (define-read-only (get-achievement (achievement-id uint))
@@ -230,6 +247,24 @@
     )
 )
 
+(define-read-only (get-total-voting-power (member principal))
+    (let 
+        (
+            (base-power (get-voting-power member))
+            (delegated-power (default-to { total-delegated-power: u0 } (map-get? delegation-power member)))
+        )
+        (+ base-power (get total-delegated-power delegated-power))
+    )
+)
+
+(define-read-only (get-delegation (member principal))
+    (map-get? delegations member)
+)
+
+(define-read-only (get-delegation-power-total (delegate principal))
+    (default-to { total-delegated-power: u0 } (map-get? delegation-power delegate))
+)
+
 (define-read-only (is-eligible-for-perk (member principal) (perk-type (string-ascii 32)))
     (let ((stats (get-member-stats member)))
         (and
@@ -299,7 +334,7 @@
     (let 
         (
             (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-            (voting-power (get-voting-power tx-sender))
+            (total-power (get-total-voting-power tx-sender))
             (current-block stacks-block-height)
         )
         (asserts! (<= current-block (get end-block proposal)) ERR-VOTING-ENDED)
@@ -308,15 +343,15 @@
         
         (map-set votes
             { proposal-id: proposal-id, voter: tx-sender }
-            { vote: support, voting-power: voting-power }
+            { vote: support, voting-power: total-power }
         )
         
         (if support
             (map-set proposals proposal-id
-                (merge proposal { yes-votes: (+ (get yes-votes proposal) voting-power) })
+                (merge proposal { yes-votes: (+ (get yes-votes proposal) total-power) })
             )
             (map-set proposals proposal-id
-                (merge proposal { no-votes: (+ (get no-votes proposal) voting-power) })
+                (merge proposal { no-votes: (+ (get no-votes proposal) total-power) })
             )
         )
         
@@ -477,6 +512,74 @@
             (milestone-bonus (* (get milestone-level progress) MILESTONE-BONUS))
         )
         (ok (+ base-bonus (+ streak-bonus milestone-bonus)))
+    )
+)
+
+(define-public (delegate-voting-power (delegate principal))
+    (let 
+        (
+            (delegator-power (get-voting-power tx-sender))
+            (current-delegation (map-get? delegations tx-sender))
+            (current-block stacks-block-height)
+        )
+        (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (asserts! (is-none (map-get? delegations delegate)) ERR-CIRCULAR-DELEGATION)
+        (asserts! (is-some (nft-get-owner? diner-pass u1)) (err u107))
+        
+        (match current-delegation
+            existing-delegation
+            (let 
+                (
+                    (old-delegate (get delegate existing-delegation))
+                    (old-delegate-power (default-to { total-delegated-power: u0 } (map-get? delegation-power old-delegate)))
+                )
+                (map-set delegation-power old-delegate
+                    { total-delegated-power: (- (get total-delegated-power old-delegate-power) delegator-power) }
+                )
+            )
+            true
+        )
+        
+        (let 
+            (
+                (delegate-power-record (default-to { total-delegated-power: u0 } (map-get? delegation-power delegate)))
+            )
+            (map-set delegation-power delegate
+                { total-delegated-power: (+ (get total-delegated-power delegate-power-record) delegator-power) }
+            )
+        )
+        
+        (map-set delegations tx-sender
+            {
+                delegate: delegate,
+                delegation-block: current-block,
+                active: true
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let 
+        (
+            (delegation-record (unwrap! (map-get? delegations tx-sender) ERR-NO-DELEGATION-FOUND))
+            (delegate (get delegate delegation-record))
+            (delegator-power (get-voting-power tx-sender))
+            (delegate-power-record (default-to { total-delegated-power: u0 } (map-get? delegation-power delegate)))
+        )
+        (asserts! (get active delegation-record) ERR-NO-DELEGATION-FOUND)
+        
+        (map-set delegation-power delegate
+            { total-delegated-power: (- (get total-delegated-power delegate-power-record) delegator-power) }
+        )
+        
+        (map-set delegations tx-sender
+            (merge delegation-record { active: false })
+        )
+        
+        (ok true)
     )
 )
 
