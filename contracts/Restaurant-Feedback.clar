@@ -741,3 +741,176 @@
         })
     )
 )
+
+(define-constant ERR-INVALID-RATING (err u119))
+(define-constant ERR-REVIEW-NOT-FOUND (err u120))
+(define-constant ERR-ALREADY-REVIEWED (err u121))
+(define-constant ERR-CANNOT-UPVOTE-OWN (err u122))
+(define-constant ERR-ALREADY-UPVOTED (err u123))
+
+(define-data-var review-id-nonce uint u1)
+
+(define-map reviews
+    uint
+    {
+        reviewer: principal,
+        rating: uint,
+        title: (string-ascii 64),
+        content: (string-ascii 256),
+        category: (string-ascii 32),
+        block-submitted: uint,
+        upvote-count: uint,
+        flagged: bool
+    }
+)
+
+(define-map reviewer-history
+    principal
+    {
+        review-count: uint,
+        total-rating-given: uint,
+        upvotes-received: uint,
+        last-review-block: uint
+    }
+)
+
+(define-map review-upvotes
+    { review-id: uint, voter: principal }
+    { upvoted: bool }
+)
+
+(define-map restaurant-rating-summary
+    (string-ascii 32)
+    {
+        total-reviews: uint,
+        total-rating: uint,
+        highest-rating: uint,
+        lowest-rating: uint
+    }
+)
+
+(define-read-only (get-review (review-id uint))
+    (map-get? reviews review-id)
+)
+
+(define-read-only (get-reviewer-profile (reviewer principal))
+    (default-to
+        { review-count: u0, total-rating-given: u0, upvotes-received: u0, last-review-block: u0 }
+        (map-get? reviewer-history reviewer)
+    )
+)
+
+(define-read-only (get-category-summary (category (string-ascii 32)))
+    (default-to
+        { total-reviews: u0, total-rating: u0, highest-rating: u0, lowest-rating: u5 }
+        (map-get? restaurant-rating-summary category)
+    )
+)
+
+(define-read-only (get-average-category-rating (category (string-ascii 32)))
+    (let ((summary (get-category-summary category)))
+        (if (> (get total-reviews summary) u0)
+            (ok (/ (get total-rating summary) (get total-reviews summary)))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (get-last-review-id)
+    (ok (- (var-get review-id-nonce) u1))
+)
+
+(define-public (submit-review
+    (rating uint)
+    (title (string-ascii 64))
+    (content (string-ascii 256))
+    (category (string-ascii 32))
+)
+    (let 
+        (
+            (review-id (var-get review-id-nonce))
+            (current-block stacks-block-height)
+            (reviewer-data (get-reviewer-profile tx-sender))
+            (category-data (get-category-summary category))
+        )
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (> (len title) u0) ERR-INVALID-PROPOSAL)
+        (asserts! (> (len content) u0) ERR-INVALID-PROPOSAL)
+        (asserts! (> (len category) u0) ERR-INVALID-PROPOSAL)
+
+        (map-set reviews review-id
+            {
+                reviewer: tx-sender,
+                rating: rating,
+                title: title,
+                content: content,
+                category: category,
+                block-submitted: current-block,
+                upvote-count: u0,
+                flagged: false
+            }
+        )
+
+        (map-set reviewer-history tx-sender
+            {
+                review-count: (+ (get review-count reviewer-data) u1),
+                total-rating-given: (+ (get total-rating-given reviewer-data) rating),
+                upvotes-received: (get upvotes-received reviewer-data),
+                last-review-block: current-block
+            }
+        )
+
+        (map-set restaurant-rating-summary category
+            {
+                total-reviews: (+ (get total-reviews category-data) u1),
+                total-rating: (+ (get total-rating category-data) rating),
+                highest-rating: (if (> rating (get highest-rating category-data)) rating (get highest-rating category-data)),
+                lowest-rating: (if (< rating (get lowest-rating category-data)) rating (get lowest-rating category-data))
+            }
+        )
+
+        (var-set review-id-nonce (+ review-id u1))
+        (update-member-engagement tx-sender)
+        (ok review-id)
+    )
+)
+
+(define-public (upvote-review (review-id uint))
+    (let 
+        (
+            (review-data (unwrap! (map-get? reviews review-id) ERR-REVIEW-NOT-FOUND))
+            (reviewer (get reviewer review-data))
+            (reviewer-data (get-reviewer-profile reviewer))
+        )
+        (asserts! (not (is-eq tx-sender reviewer)) ERR-CANNOT-UPVOTE-OWN)
+        (asserts! (is-none (map-get? review-upvotes { review-id: review-id, voter: tx-sender })) ERR-ALREADY-UPVOTED)
+
+        (map-set review-upvotes
+            { review-id: review-id, voter: tx-sender }
+            { upvoted: true }
+        )
+
+        (map-set reviews review-id
+            (merge review-data { upvote-count: (+ (get upvote-count review-data) u1) })
+        )
+
+        (map-set reviewer-history reviewer
+            (merge reviewer-data { upvotes-received: (+ (get upvotes-received reviewer-data) u1) })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (flag-review (review-id uint))
+    (let 
+        (
+            (review-data (unwrap! (map-get? reviews review-id) ERR-REVIEW-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+        (map-set reviews review-id
+            (merge review-data { flagged: true })
+        )
+        (ok true)
+    )
+)
